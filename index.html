@@ -62,6 +62,14 @@ button{cursor:pointer}
 .joinrow .btn{flex:none}
 .fine{margin:0;font-size:.8rem;color:var(--muted);text-align:center}
 .theme-fab{position:fixed;top:calc(12px + env(safe-area-inset-top,0px));right:16px}
+.check{display:flex;align-items:center;gap:8px;font-size:.85rem;color:var(--muted);cursor:pointer}
+.check input{width:16px;height:16px;accent-color:var(--accent);flex:none}
+.live{margin:0;display:flex;align-items:center;justify-content:center;gap:8px;font-size:.8rem;color:var(--muted);font-variant-numeric:tabular-nums}
+.live i{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:none}
+.live.on i{background:var(--accent);animation:pulse 2s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 var(--glow)}70%{box-shadow:0 0 0 7px transparent}100%{box-shadow:0 0 0 0 transparent}}
+.pill{font-size:.68rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;padding:5px 8px;border-radius:99px;background:var(--glow);color:var(--accent);border:1px solid var(--accent)}
+.bub img.blur{filter:blur(22px)}
 
 /* ---------- Icon buttons ---------- */
 .ib{width:40px;height:40px;display:grid;place-items:center;border-radius:12px;border:1px solid var(--line);background:var(--surface);flex:none}
@@ -143,12 +151,18 @@ button{cursor:pointer}
       <label for="name">Your name</label>
       <input class="input" id="name" maxlength="20" autocomplete="nickname" placeholder="e.g. Priya">
     </div>
-    <button class="btn" id="create">Start a new room</button>
+    <div class="field" style="gap:10px">
+      <button class="btn" id="create">Start a new room</button>
+      <label class="check" for="pub"><input type="checkbox" id="pub"> Public: let strangers find and join this room</label>
+    </div>
     <div class="or">or join with a code</div>
     <form class="joinrow" id="joinForm">
       <input class="input code" id="code" maxlength="6" inputmode="text" autocapitalize="characters" autocomplete="off" spellcheck="false" placeholder="K7P2QX" aria-label="6 character room code">
       <button class="btn ghost" type="submit">Join</button>
     </form>
+    <div class="or">or meet someone new</div>
+    <button class="btn ghost" id="random">Join a random room</button>
+    <p class="live" id="live"><i></i><span id="liveText">Connecting…</span></p>
     <p class="fine">Peer to peer. No server keeps your messages. Up to 10 people per room.</p>
   </div>
 </main>
@@ -156,7 +170,8 @@ button{cursor:pointer}
 <!-- CHAT -->
 <section class="chat" id="chat" hidden>
   <header class="bar">
-    <button class="chip" id="copyCode" title="Copy invite link" style="cursor:pointer"><small>Room</small><b id="roomCode">------</b></button>
+    <button class="chip" id="copyCode" title="Copy room code" style="cursor:pointer"><small>Room</small><b id="roomCode">------</b></button>
+    <span class="pill" id="pubBadge" hidden>Public</span>
     <div class="spacer"></div>
     <div class="timer" id="timer" aria-label="Time left">30:00</div>
     <div class="members">
@@ -252,7 +267,7 @@ codeInput.addEventListener('input', () => { codeInput.value = codeInput.value.to
 const hashCode = (location.hash || '').replace('#', '').toUpperCase();
 if (/^[A-Z0-9]{6}$/.test(hashCode)) codeInput.value = hashCode;
 
-$('create').addEventListener('click', () => start(newCode(), true));
+$('create').addEventListener('click', () => start(newCode(), true, undefined, { pub: $('pub').checked }));
 $('joinForm').addEventListener('submit', (e) => {
   e.preventDefault();
   if (!/^[A-Z0-9]{6}$/.test(codeInput.value)) { toast('Enter the 6 character room code.'); codeInput.focus(); return; }
@@ -267,6 +282,9 @@ const announced = new Set();
 let messages = [];             // { id, who, name, text?, img?, ts, me }
 let warned5 = false, warned1 = false;
 let selfId = 'self';
+let pubRoom = false, migrating = false;
+let lobby = null, sendStatus = null;
+const lobbyPeers = new Map();  // id -> { code, count, created }
 
 async function loadTrystero(){
   if (trystero) return trystero;
@@ -275,7 +293,7 @@ async function loadTrystero(){
   return trystero;
 }
 
-async function start(roomCode, creator, silentName){
+async function start(roomCode, creator, silentName, opts = {}){
   myName = cleanName(nameInput.value) || silentName || ('Guest-' + newCode().slice(0, 2));
   nameInput.value = myName;
   safe.set('hush:name', myName);
@@ -284,7 +302,7 @@ async function start(roomCode, creator, silentName){
   catch { toast('Could not load the connection library. Check your internet and try again.'); return; }
 
   code = roomCode; ended = false; peers.clear(); announced.clear(); messages = [];
-  warned5 = warned1 = false; joinedAt = Date.now(); roomStart = null;
+  warned5 = warned1 = false; joinedAt = Date.now(); roomStart = null; pubRoom = !!opts.pub;
 
   const saved = safe.get('hush:room:' + code);
   if (saved) {
@@ -311,24 +329,27 @@ async function start(roomCode, creator, silentName){
   room.onPeerLeave((id) => {
     const p = peers.get(id); peers.delete(id); announced.delete(id);
     if (p) sys(p.name + ' left');
-    renderMembers();
+    renderMembers(); broadcastStatus(); maybeMigrate();
   });
 
-  safe.set('hush:active', JSON.stringify({ code, name: myName }));
+  safe.set('hush:active', JSON.stringify({ code, name: myName, pub: pubRoom }));
   history.replaceState(null, '', '#' + code);
   $('home').hidden = true; $('chat').hidden = false;
   $('roomCode').textContent = code;
   $('feed').innerHTML = '';
   messages.forEach(renderMessage);
-  sys(creator ? 'Room created. Share the code or tap it to copy the invite link.' : 'Connecting to the room…');
+  $('pubBadge').hidden = !pubRoom;
+  sys(creator ? 'Room created. Share the code, or tap it to copy.' : 'Connecting to the room…');
+  if (opts.note) sys(opts.note);
+  if (pubRoom) sys('Public room: anyone online can join. Images from others stay blurred until you tap them.');
   renderMembers(); updateTimer();
   clearInterval(tickId); tickId = setInterval(updateTimer, 1000);
   clearTimeout(startFallback);
   if (!roomStart) startFallback = setTimeout(() => { if (!roomStart && !ended) { roomStart = Date.now(); sys('You are the first one here. The 30 minute timer has started.'); persist(); updateTimer(); } }, 6000);
-  persist();
+  persist(); broadcastStatus();
 }
 
-function helloData(){ return { name: myName, joinedAt, roomStart }; }
+function helloData(){ return { name: myName, joinedAt, roomStart, pub: pubRoom }; }
 function peerName(id, fallback){ return (peers.get(id) && peers.get(id).name) || cleanName(fallback) || 'Guest'; }
 
 function memberOrder(){
@@ -347,8 +368,9 @@ function onHello(d, id){
   }
   const order = memberOrder();
   if (order.findIndex(m => m.id === selfId) >= MAX_MEMBERS) { leaveRoom('This room is full (10 people max).'); return; }
+  if (d.pub && !pubRoom) { pubRoom = true; $('pubBadge').hidden = false; sys('This is a public room. Images from others stay blurred until you tap them.'); }
   if (first) { announced.add(id); sys(name + ' joined'); sendHello(helloData(), id); }
-  renderMembers();
+  renderMembers(); broadcastStatus();
 }
 
 /* ============ Rendering ============ */
@@ -366,7 +388,8 @@ function renderMessage(m){
   if (m.img) {
     b.classList.add('imgb');
     const im = document.createElement('img'); im.src = m.img; im.alt = 'Image from ' + m.name;
-    im.addEventListener('click', () => openLightbox(m.img));
+    if (pubRoom && !m.me) im.classList.add('blur');
+    im.addEventListener('click', () => { if (im.classList.contains('blur')) im.classList.remove('blur'); else openLightbox(m.img); });
     b.appendChild(im);
   } else {
     b.textContent = m.text;
@@ -485,8 +508,7 @@ async function shareImage(file){
 
 /* ============ Leaving / ending ============ */
 $('copyCode').addEventListener('click', async () => {
-  const link = location.origin + location.pathname + '#' + code;
-  try { await navigator.clipboard.writeText(link); toast('Invite link copied.'); }
+  try { await navigator.clipboard.writeText(code); toast('Code copied.'); }
   catch { toast('Room code: ' + code); }
 });
 $('leave').addEventListener('click', () => leaveRoom());
@@ -499,6 +521,7 @@ function teardown(){
   if (code) safe.del('hush:room:' + code);
   messages = []; lastWho = null; peers.clear(); announced.clear();
   $('pop').hidden = true; $('emojis').hidden = true;
+  pubRoom = false; $('pubBadge').hidden = true; broadcastStatus();
 }
 function showOverlay(title, body){
   const o = document.createElement('div'); o.className = 'over';
@@ -520,18 +543,90 @@ function endSession(){
   ended = true; teardown();
   showOverlay('Time is up', 'This room has closed and the chat has been cleared from this device.');
 }
-addEventListener('beforeunload', () => { try { room && room.leave(); } catch {} });
+addEventListener('beforeunload', () => { try { room && room.leave(); lobby && lobby.leave(); } catch {} });
+
+/* ============ Lobby: online count + random rooms ============ */
+function statusData(){
+  const pub = !!(room && !ended && pubRoom);
+  return { code: pub ? code : null, count: pub ? peers.size + 1 : 0, created: roomStart || joinedAt };
+}
+function broadcastStatus(){ if (lobby && sendStatus) { try { sendStatus(statusData()); } catch {} } }
+
+function openRooms(){
+  const map = new Map();
+  const add = (c, n, cr) => {
+    if (!c || n >= MAX_MEMBERS) return;
+    const e = map.get(c);
+    if (!e) map.set(c, { code: c, count: n, created: cr });
+    else { e.count = Math.max(e.count, n); e.created = Math.min(e.created, cr); }
+  };
+  lobbyPeers.forEach(p => add(p.code, p.count, p.created));
+  const own = statusData(); add(own.code, own.count, own.created);
+  return [...map.values()];
+}
+function updateLive(){
+  if (!lobby) return;
+  const rooms = openRooms().length;
+  $('live').classList.add('on');
+  $('liveText').textContent = (lobbyPeers.size + 1) + ' online · ' + rooms + ' open public room' + (rooms === 1 ? '' : 's');
+}
+/* Two people who each created a public room while alone would never meet.
+   The one in the newer room moves to the older one, so they always converge. */
+function maybeMigrate(){
+  if (!room || ended || !pubRoom || peers.size > 0 || migrating) return;
+  const mine = roomStart || joinedAt;
+  const better = openRooms()
+    .filter(r => r.code !== code && (r.created < mine || (r.created === mine && r.code < code)))
+    .sort((a, b) => a.created - b.created || (a.code < b.code ? -1 : 1))[0];
+  if (!better) return;
+  migrating = true;
+  try { room.leave(); } catch {}
+  safe.del('hush:room:' + code); clearInterval(tickId); clearTimeout(startFallback);
+  start(better.code, false, undefined, { pub: true, note: 'Found someone. You moved into their room.' })
+    .finally(() => { migrating = false; });
+}
+async function initLobby(){
+  try {
+    const t = await loadTrystero();
+    lobby = t.joinRoom({ appId: APP_ID }, 'lobby-v1');
+    const s = lobby.makeAction('status'); sendStatus = s[0];
+    s[1]((d, id) => {
+      if (!d) return;
+      lobbyPeers.set(id, {
+        code: (typeof d.code === 'string' && /^[A-Z0-9]{6}$/.test(d.code)) ? d.code : null,
+        count: Math.min(MAX_MEMBERS, Math.max(0, Number(d.count) || 0)),
+        created: Number(d.created) || 0
+      });
+      updateLive(); maybeMigrate();
+    });
+    lobby.onPeerJoin((id) => { if (!lobbyPeers.has(id)) lobbyPeers.set(id, { code: null, count: 0, created: 0 }); try { sendStatus(statusData(), id); } catch {} updateLive(); });
+    lobby.onPeerLeave((id) => { lobbyPeers.delete(id); updateLive(); maybeMigrate(); });
+    updateLive(); broadcastStatus();
+  } catch { $('liveText').textContent = 'Random rooms are unavailable right now'; }
+}
+$('random').addEventListener('click', () => {
+  const open = openRooms().filter(r => r.code !== code);
+  const waiting = open.filter(r => r.count === 1);
+  const pool = waiting.length ? waiting : open;
+  if (pool.length) {
+    const r = pool[Math.floor(Math.random() * pool.length)];
+    start(r.code, false, undefined, { pub: true, note: 'Joined a random public room.' });
+  } else {
+    start(newCode(), true, undefined, { pub: true, note: 'No one else is waiting yet. Stay here and the next person who taps Random will join you.' });
+  }
+});
 
 /* ============ Rejoin after refresh ============ */
 (function resume(){
   const a = safe.get('hush:active'); if (!a) return;
   try {
-    const { code: c, name } = JSON.parse(a);
+    const { code: c, name, pub } = JSON.parse(a);
     const d = JSON.parse(safe.get('hush:room:' + c) || 'null');
-    if (c && d && d.roomStart && d.roomStart + SESSION_MS > Date.now()) { nameInput.value = name || nameInput.value; start(c, false, name); }
+    if (c && d && d.roomStart && d.roomStart + SESSION_MS > Date.now()) { nameInput.value = name || nameInput.value; start(c, false, name, { pub: !!pub }); }
     else { safe.del('hush:active'); }
   } catch { safe.del('hush:active'); }
 })();
+initLobby();
 </script>
 </body>
 </html>
